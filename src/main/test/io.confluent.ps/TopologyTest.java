@@ -1,22 +1,26 @@
 package io.confluent.ps;
 
+import com.google.common.collect.Maps;
 import io.confluent.kafka.serializers.AbstractKafkaAvroSerDeConfig;
 import org.apache.kafka.common.serialization.Serdes;
 import org.apache.kafka.streams.*;
 import org.apache.kafka.streams.kstream.*;
 import org.apache.kafka.streams.processor.ProcessorContext;
-import org.apache.kafka.streams.state.TimestampedKeyValueStore;
-import org.apache.kafka.streams.state.ValueAndTimestamp;
+import org.apache.kafka.streams.processor.PunctuationType;
+import org.apache.kafka.streams.state.*;
 import org.junit.Before;
 import org.junit.Test;
 
+import java.time.Duration;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Properties;
 
-import static java.time.Duration.ofSeconds;
+import static java.time.Duration.ofMillis;
+import static java.time.Duration.ofMinutes;
 import static org.apache.kafka.common.utils.Utils.*;
-import static org.apache.kafka.common.utils.Utils.mkEntry;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
 
 public class TopologyTest {
 
@@ -26,6 +30,12 @@ public class TopologyTest {
     private TestOutputTopic<String, String> outputTopic;
     private TestInputTopic<String, String> triggerTopic;
     private TopologyTestDriver testDriver;
+
+    private static final String FINAL_STORE = "FINAL_STORE";
+    private static final String SUPPRESSION_STORE = "suppression_store";
+
+    private int SUPPRESSION_CHECK_FREQUENCY = 10;
+    public static final Duration suppressionWindowTime = Duration.ofMillis(500);
 
 
     public static final Properties config = mkProperties(mkMap(
@@ -42,7 +52,7 @@ public class TopologyTest {
     public void setUp() {
 
         //change this to run different toplogies availabe below
-        StreamsBuilder builder = createTopologyWithTrigger();
+        StreamsBuilder builder = createTopologyWithWallClockSuppression();
 
         testDriver = new TopologyTestDriver(builder.build(), config);
 
@@ -59,20 +69,31 @@ public class TopologyTest {
     @Test
     public void test_ktable_correct(){
 
-        inputTopicChildOne.pipeInput("a","b");
-        inputTopicChildTwo.pipeInput("a","c");
-
-        inputTopicChildOne.pipeInput("a","b");
-        inputTopicChildTwo.pipeInput("a","c");
-
-        inputTopicChildTwo.pipeInput("a","c");
-        inputTopicChildOne.pipeInput("a","b");
-
         inputTopicFinal.pipeInput("a", "final: ");
 
-        //send trigger event
-        triggerTopic.pipeInput("a", "GO");
+        inputTopicChildOne.pipeInput("a","b");
+        inputTopicChildOne.pipeInput("a","b");
+        inputTopicChildTwo.pipeInput("a","b");
 
+        inputTopicChildTwo.pipeInput("a","c");
+        inputTopicChildTwo.pipeInput("a","c");
+        inputTopicChildTwo.pipeInput("a","c");
+
+        //send trigger event
+        //commented out as it is not required for time based suppression
+        // triggerTopic.pipeInput("a", "GO");
+
+        Duration waitUntil = suppressionWindowTime.plus(ofMillis(500));
+
+        //wait for a record to be emitted
+        await().during(waitUntil)
+                .conditionEvaluationListener(condition ->  System.out.println(String.format("Still no message emitted... (elapsed:%dms, remaining:%dms)", condition.getElapsedTimeInMS(), condition.getRemainingTimeInMS())))
+                .until(() -> outputTopic.readValuesToList().size() == 0);
+
+        // move time forward
+        long twoMinutesMs = ofMinutes(2).toMillis();
+        long now = System.currentTimeMillis();
+        testDriver.advanceWallClockTime(now + twoMinutesMs);
 
         List<KeyValue<String, String>> keyValues = outputTopic.readKeyValuesToList();
 
@@ -105,7 +126,7 @@ public class TopologyTest {
         final KTable<String, String> parentEventTable = groupAndAccumulate(parentEventStream, "input-topic-final");
 
         KTable<String, String> finalJoin = parentEventTable.join(joinedChildrenTable,
-                (leftValue, rightValue) -> leftValue + rightValue, Materialized.as("FINAL_STORE").with(Serdes.String(), Serdes.String())
+                (leftValue, rightValue) -> leftValue + rightValue, Materialized.as(FINAL_STORE).with(Serdes.String(), Serdes.String())
         );
 
         finalJoin.toStream().to("output-topic", Produced.with(Serdes.String(), Serdes.String()));
@@ -134,7 +155,7 @@ public class TopologyTest {
 
         //Creates state store that is used by transformer after trigger
         finalDocTable.join(joinedChildrenTable,
-                (leftValue, rightValue) -> leftValue + rightValue, Materialized.as("FINAL_STORE")
+                (leftValue, rightValue) -> leftValue + rightValue, Materialized.as(FINAL_STORE)
         );
 
         //Suppress until trigger event
@@ -145,7 +166,7 @@ public class TopologyTest {
 
             @Override
             public void init(ProcessorContext contextParam) {
-                this.finalJoinStore = (TimestampedKeyValueStore<String, String>) contextParam.getStateStore("FINAL_STORE");
+                this.finalJoinStore = (TimestampedKeyValueStore<String, String>) contextParam.getStateStore(FINAL_STORE);
             }
 
             @Override
@@ -161,7 +182,7 @@ public class TopologyTest {
             public void close() {
                 finalJoinStore.close();
             }
-        }, "FINAL_STORE");
+        }, FINAL_STORE);
 
         filteredKTable.to("output-topic", Produced.with(Serdes.String(), Serdes.String()));
         return builder;
@@ -187,7 +208,7 @@ public class TopologyTest {
 
         //Creates state store that is used by transformer after trigger
         finalDocTable.join(accumulatedChildrenTable,
-                (leftValue, rightValue) -> leftValue + rightValue, Materialized.as("FINAL_STORE")
+                (leftValue, rightValue) -> leftValue + rightValue, Materialized.as(FINAL_STORE)
         );
 
         //Suppress until trigger event
@@ -198,7 +219,7 @@ public class TopologyTest {
 
             @Override
             public void init(ProcessorContext contextParam) {
-                this.finalJoinStore = (TimestampedKeyValueStore<String, String>) contextParam.getStateStore("FINAL_STORE");
+                this.finalJoinStore = (TimestampedKeyValueStore<String, String>) contextParam.getStateStore(FINAL_STORE);
             }
 
             @Override
@@ -215,9 +236,85 @@ public class TopologyTest {
             public void close() {
                 finalJoinStore.close();
             }
-        }, "FINAL_STORE");
+        }, FINAL_STORE);
 
         filteredKTable.to("output-topic", Produced.with(Serdes.String(), Serdes.String()));
+        return builder;
+    }
+
+    private StreamsBuilder createTopologyWithWallClockSuppression() {
+        final StreamsBuilder builder = new StreamsBuilder();
+
+        KStream<String, String> triggerStream = builder.stream("trigger-topic", Consumed.with(Serdes.String(), Serdes.String()));
+
+        final KStream<String, String> childStream1 = builder.stream("input-topic-child1", Consumed.with(Serdes.String(), Serdes.String()));
+
+        KStream<String, String> childStream2 = builder.stream("input-topic-child2", Consumed.with(Serdes.String(), Serdes.String()));
+
+        KStream<String, String> mergedChildrenStream = childStream1.merge(childStream2, Named.as("merged-children-stream"));
+
+        KTable accumulatedChildrenTable = groupAndAccumulate(mergedChildrenStream, "accumulated-children-store");
+
+        //Final event
+        KStream<String, String> finalDocStream = builder.stream("input-topic-final", Consumed.with(Serdes.String(), Serdes.String()));
+        final KTable<String, String> finalDocTable = finalDocStream.toTable();
+
+        //Creates state store that is used by transformer after trigger
+        KTable<String, String> finalKTable = finalDocTable.join(accumulatedChildrenTable,
+                (leftValue, rightValue) -> leftValue + rightValue, Materialized.as(FINAL_STORE)
+        );
+
+        KStream<String, String> finalKStream = finalKTable.toStream();
+
+        //add state store to the topology
+        StoreBuilder<KeyValueStore<Long, String>> suppressionStoreBuilder = Stores.keyValueStoreBuilder(Stores.persistentKeyValueStore(SUPPRESSION_STORE), Serdes.Long(), Serdes.String()).withLoggingEnabled(Maps.newHashMap());
+        builder.addStateStore(suppressionStoreBuilder);
+
+        //Suppress until trigger event
+        KStream<String, String> suppressedStream = finalKStream.transform(() -> new Transformer<String, String, KeyValue<String, String>>() {
+
+            private TimestampedKeyValueStore<String, String> finalJoinStore;
+            private KeyValueStore<Long, String> suppressionStore;
+
+            private Duration SUPPRESSION_TIME = suppressionWindowTime;
+
+            @Override
+            public void init(ProcessorContext contextParam) {
+                this.finalJoinStore = (TimestampedKeyValueStore<String, String>) contextParam.getStateStore(FINAL_STORE);
+                this.suppressionStore = (KeyValueStore<Long, String>) contextParam.getStateStore(SUPPRESSION_STORE);
+
+                contextParam.schedule(SUPPRESSION_CHECK_FREQUENCY, PunctuationType.WALL_CLOCK_TIME, timestamp -> {
+                    long expireTime = System.currentTimeMillis() - SUPPRESSION_TIME.toMillis();
+                    KeyValueIterator<Long, String> expiredEntries = suppressionStore.range(0l, expireTime); // ready for emission
+
+                    HashSet<String> uniqKeys = new HashSet<>();
+                    expiredEntries.forEachRemaining(entry -> {
+                        uniqKeys.add(entry.value);
+                        suppressionStore.delete(entry.key);
+                    });
+
+                    uniqKeys.forEach(key -> {
+                        ValueAndTimestamp<String> latestValue = finalJoinStore.get(key);
+                        contextParam.forward(key, latestValue.value());
+                    });
+                });
+            }
+
+            @Override
+            public KeyValue<String,String> transform(String key, String value) {
+                // update the last seen time stamp for suppression
+                long now = System.currentTimeMillis();
+                suppressionStore.put(now, key);
+                return null; // don't emit here, see punctuator
+            }
+
+            @Override
+            public void close() {
+                suppressionStore.close();
+            }
+        }, FINAL_STORE, SUPPRESSION_STORE);
+
+        suppressedStream.to("output-topic", Produced.with(Serdes.String(), Serdes.String()));
         return builder;
     }
 
